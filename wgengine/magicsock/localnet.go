@@ -42,6 +42,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/types/key"
 )
 
 // LocalNetworkScope names the addresses a [LocalNetworkRule] guards.
@@ -68,7 +69,39 @@ const (
 type LocalNetworkRule struct {
 	Scope        LocalNetworkScope
 	TestPrefixes []netip.Prefix // LocalNetworkTest only
+	// Hold is Android's hold: every send to an address in the scope is held
+	// until [ReleaseLocalNetworkHold].
+	Hold bool
 }
+
+// ReleaseLocalNetworkHold lifts the hold.
+//
+// STUB: it lifts nothing.
+func ReleaseLocalNetworkHold() {}
+
+// localLineWindow is how often one line is written for one peer and address.
+const localLineWindow = time.Minute
+
+// localHeld reports whether the hold keeps back a send to ap.
+//
+// STUB: it holds nothing.
+func (c *Conn) localHeld(ap netip.AddrPort, peer key.NodePublic, now mono.Time) bool { return false }
+
+// looksLocalFor reports whether a peer with the given addresses looks local.
+//
+// STUB: no peer does.
+func looksLocalFor(f *localFacts, peer iter.Seq[netip.AddrPort]) bool { return false }
+
+// LooksLocal reports whether the peer whose node key is k looks local.
+//
+// STUB: it knows no peer.
+func LooksLocal(k key.NodePublic) (looksLocal, ok bool) { return false, false }
+
+// localRegister and localDeregister keep the set of live Conns.
+//
+// STUB: they keep none.
+func localRegister(c *Conn)   {}
+func localDeregister(c *Conn) {}
 
 // localRuleP is the rule every Conn in the process reads; nil is no rule.
 var localRuleP atomic.Pointer[LocalNetworkRule]
