@@ -720,6 +720,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.netMon = opts.NetMon
+	c.localRefresh()
 	c.health = opts.HealthTracker
 	c.extraRootCAs = opts.ExtraRootCAs
 	c.derpAppName = opts.DERPAppName
@@ -1045,6 +1046,7 @@ func (c *Conn) setNetInfoHavePortMap() {
 }
 
 func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
+	c.localRefresh()
 	c.mu.Lock()
 	dm := c.derpMap
 	c.mu.Unlock()
@@ -2637,6 +2639,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 
 	// Remember this route if not present.
 	var dup bool
+	var localSkipped bool // the Local Network rule skips src for a peer: no pong to it
 	if isDerp {
 		if _, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
 			numNodes = 1
@@ -2649,6 +2652,9 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 			if ep.addCandidateEndpoint(src.ap, dm.TxID) {
 				dup = true
 				return false
+			}
+			if !ep.localAllow(src.ap) {
+				localSkipped = true
 			}
 			numNodes++
 			if numNodes == 1 && dstKey.IsZero() {
@@ -2668,6 +2674,9 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpN
 
 	if numNodes == 0 {
 		c.logf("[unexpected] got disco ping from %v/%v for node not in peers", src, derpNodeSrc)
+		return
+	}
+	if localSkipped {
 		return
 	}
 
@@ -3986,6 +3995,7 @@ func (c *Conn) Rebind() {
 	var ifIPs []netip.Prefix
 	if c.netMon != nil {
 		st := c.netMon.InterfaceState()
+		c.local.ifState.Store(st)
 		defIf := st.DefaultRouteInterface
 		ifIPs = st.InterfaceIPs[defIf]
 		c.logf("Rebind; defIf=%q, ips=%v", defIf, ifIPs)
