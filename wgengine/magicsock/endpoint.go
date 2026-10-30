@@ -632,6 +632,13 @@ func (de *endpoint) DstToBytes() []byte  { return packIPPort(de.fakeWGAddr) }
 func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr netip.AddrPort, sendWGPing bool) {
 	udpAddr = de.bestAddr.epAddr
 
+	if udpAddr.ap.IsValid() && !udpAddr.vni.IsSet() && !de.localAllowLocked(udpAddr.ap, now) {
+		// The Local Network rule skips the best address (the facts it
+		// reads changed since it was chosen): forget it and send by DERP.
+		de.clearBestAddrLocked()
+		return epAddr{}, de.derpAddr, false
+	}
+
 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
 		return udpAddr, netip.AddrPort{}, false
 	}
@@ -640,6 +647,9 @@ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr n
 		// If the endpoint is wireguard-only, we don't have a DERP
 		// address to send to, so we have to send to the UDP address.
 		udpAddr, shouldPing := de.addrForWireGuardSendLocked(now)
+		if udpAddr.ap.IsValid() && !de.localAllowLocked(udpAddr.ap, now) {
+			return epAddr{}, netip.AddrPort{}, shouldPing
+		}
 		return udpAddr, netip.AddrPort{}, shouldPing
 	}
 
@@ -1352,6 +1362,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
 	}
+	if !ep.vni.IsSet() && !de.localAllowLocked(ep.ap, now) {
+		return // the Local Network rule skips this address
+	}
 	epDisco := de.disco.Load()
 	if epDisco == nil {
 		return
@@ -1429,6 +1442,9 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
 		if !st.lastPing.IsZero() && now.Sub(st.lastPing) < discoPingInterval {
 			continue
 		}
+		if !de.localAllowLocked(ep, now) {
+			continue // the Local Network rule skips this address
+		}
 
 		firstPing := !sentAny
 		sentAny = true
@@ -1473,6 +1489,9 @@ func (de *endpoint) sendWireGuardOnlyPingsLocked(now mono.Time) {
 		}
 		if ipp.Addr().Is6() && de.c.noV6.Load() {
 			continue
+		}
+		if !de.localAllowLocked(ipp, now) {
+			continue // the Local Network rule skips this address
 		}
 
 		go de.sendWireGuardOnlyPing(ipp, now)
