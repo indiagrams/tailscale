@@ -428,6 +428,12 @@ type Conn struct {
 	// This allows tests to pass when the user's machine is offline,
 	// but allows us to still test network-down behaviour when desired.
 	checkNetworkUpDuringTests bool
+
+	// localStart is when the Conn was made: the start of the Local Network
+	// rule's wait for the first netcheck report (localnet.go).
+	localStart mono.Time
+	// local is the Local Network rule's state in this Conn (localnet.go).
+	local localConnState
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -590,6 +596,7 @@ func newConn(logf logger.Logf) *Conn {
 		discoInfo:     make(map[key.DiscoPublic]*discoInfo),
 		cloudInfo:     cloudinfo.New(logf),
 		initializedAt: mono.Now(),
+		localStart:    mono.Now(),
 	}
 	c.discoAtomic.Set(discoPrivate)
 	c.bind = &connBind{Conn: c, closed: true}
