@@ -753,6 +753,7 @@ func NewConn(opts Options) (*Conn, error) {
 	}
 
 	c.logf("magicsock: disco key = %v", c.discoAtomic.Short())
+	localRegister(c)
 	return c, nil
 }
 
@@ -1523,6 +1524,9 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 		// A [*lazyEndpoint] may end up on this TX codepath when wireguard-go is
 		// deemed "under handshake load" and ends up transmitting a cookie reply
 		// using the received [conn.Endpoint] in [device.SendHandshakeCookie].
+		if c.localHeld(ep.src.ap, key.NodePublic{}, mono.Now()) {
+			return nil // Android's hold keeps this send back
+		}
 		if ep.src.ap.Addr().Is6() {
 			return c.pconn6.WriteWireGuardBatchTo(buffs, ep.src, offset)
 		}
@@ -1674,6 +1678,9 @@ func (c *Conn) sendUDPStd(addr netip.AddrPort, b []byte) (sent bool, err error) 
 // returns (false, nil); it's not an error, but nothing was sent.
 func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if addr.Addr() != tailcfg.DerpMagicIPAddr {
+		if c.localHeld(addr, pubKey, mono.Now()) {
+			return false, nil // Android's hold keeps this send back
+		}
 		return c.sendUDP(addr, b, isDisco, isGeneveEncap)
 	}
 
@@ -3571,6 +3578,7 @@ func (c *connBind) isClosed() bool {
 //
 // Only the first close does anything. Any later closes return nil.
 func (c *Conn) Close() error {
+	localDeregister(c)
 	// Close the [eventbus.Client] to wait for subscribers to
 	// return before acquiring c.mu:
 	//  1. Event handlers also acquire c.mu, they can deadlock with c.Close().

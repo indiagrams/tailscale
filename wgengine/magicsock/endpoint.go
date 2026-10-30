@@ -638,6 +638,11 @@ func (de *endpoint) addrForSendLocked(now mono.Time) (udpAddr epAddr, derpAddr n
 		de.clearBestAddrLocked()
 		return epAddr{}, de.derpAddr, false
 	}
+	if udpAddr.ap.IsValid() && de.c.localHeld(udpAddr.ap, de.publicKey, now) {
+		// Android's hold keeps sends to this address back: DERP carries
+		// the packet.
+		return epAddr{}, de.derpAddr, false
+	}
 
 	if udpAddr.ap.IsValid() && !now.After(de.trustBestAddrUntil) {
 		return udpAddr, netip.AddrPort{}, false
@@ -1362,8 +1367,14 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
 		return
 	}
-	if !ep.vni.IsSet() && !de.localAllowLocked(ep.ap, now) {
-		return // the Local Network rule skips this address
+	if !ep.vni.IsSet() {
+		if !de.localAllowLocked(ep.ap, now) {
+			return // the Local Network rule skips this address
+		}
+		if de.c.localHeld(ep.ap, de.publicKey, now) {
+			return // Android's hold keeps this send back
+		}
+		de.c.localOwnNetworkAttempt(de.publicKey, ep.ap, now)
 	}
 	epDisco := de.disco.Load()
 	if epDisco == nil {
@@ -1490,8 +1501,8 @@ func (de *endpoint) sendWireGuardOnlyPingsLocked(now mono.Time) {
 		if ipp.Addr().Is6() && de.c.noV6.Load() {
 			continue
 		}
-		if !de.localAllowLocked(ipp, now) {
-			continue // the Local Network rule skips this address
+		if !de.localAllowLocked(ipp, now) || de.c.localHeld(ipp, de.publicKey, now) {
+			continue // the Local Network rule skips this address, or Android's hold keeps it back
 		}
 
 		go de.sendWireGuardOnlyPing(ipp, now)
