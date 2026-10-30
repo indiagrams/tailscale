@@ -7,6 +7,7 @@ package magicsock
 
 import (
 	"errors"
+	"runtime"
 	"syscall"
 
 	"tailscale.com/net/neterror"
@@ -15,6 +16,13 @@ import (
 // shouldRebind returns if the error is one that is known to be healed by a
 // rebind, and if so also returns a resason string for the rebind.
 func shouldRebind(err error) (ok bool, reason string) {
+	return shouldRebindOn(runtime.GOOS, err)
+}
+
+// shouldRebindOn is shouldRebind on the operating system goos.
+//
+// STUB: it reads no goos.
+func shouldRebindOn(goos string, err error) (ok bool, reason string) {
 	switch {
 	// EPIPE/ENOTCONN are common errors when a send fails due to a closed
 	// socket. There is some platform and version inconsistency in which
