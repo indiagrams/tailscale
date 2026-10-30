@@ -43,6 +43,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/util/mak"
 )
 
 // LocalNetworkScope names the addresses a [LocalNetworkRule] guards.
@@ -69,39 +70,190 @@ const (
 type LocalNetworkRule struct {
 	Scope        LocalNetworkScope
 	TestPrefixes []netip.Prefix // LocalNetworkTest only
-	// Hold is Android's hold: every send to an address in the scope is held
-	// until [ReleaseLocalNetworkHold].
+	// Hold is Android's hold: every send to an address in the scope, a disco
+	// ping or data, is held (not sent) until [ReleaseLocalNetworkHold]. Once
+	// released, the hold is never set again in this process.
 	Hold bool
 }
 
-// ReleaseLocalNetworkHold lifts the hold.
-//
-// STUB: it lifts nothing.
-func ReleaseLocalNetworkHold() {}
+// localLifted is whether the hold was released; it is never cleared.
+var localLifted atomic.Bool
 
-// localLineWindow is how often one line is written for one peer and address.
-const localLineWindow = time.Minute
+// ReleaseLocalNetworkHold lifts Android's hold, for the life of the process.
+// The embedding app calls it once it has asked for the permission, or found
+// it already granted; the fork is told nothing else, whatever the answer was.
+func ReleaseLocalNetworkHold() {
+	if localLifted.Swap(true) {
+		return
+	}
+	if r := localRule(); r == nil || !r.Hold {
+		return
+	}
+	conns := localConns.live()
+	if len(conns) == 0 {
+		localConns.mu.Lock()
+		localConns.liftedUnsaid = true
+		localConns.mu.Unlock()
+		return
+	}
+	for _, c := range conns {
+		c.logf("localnet hold lifted")
+	}
+}
 
-// localHeld reports whether the hold keeps back a send to ap.
-//
-// STUB: it holds nothing.
-func (c *Conn) localHeld(ap netip.AddrPort, peer key.NodePublic, now mono.Time) bool { return false }
+// localHoldOn reports whether the hold is set and not yet released.
+func localHoldOn() bool {
+	r := localRule()
+	return r != nil && r.Hold && !localLifted.Load()
+}
+
+// localConnSet is the set of live Conns, which LooksLocal asks.
+type localConnSet struct {
+	mu           sync.Mutex
+	set          map[*Conn]bool
+	liftedUnsaid bool // the hold was lifted while no Conn was live: the next one says so
+}
+
+var localConns localConnSet
+
+// live is the Conns in s.
+func (s *localConnSet) live() []*Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Collect(maps.Keys(s.set))
+}
+
+// localRegister adds c to the live Conns; NewConn calls it.
+func localRegister(c *Conn) {
+	localConns.mu.Lock()
+	mak.Set(&localConns.set, c, true)
+	say := localConns.liftedUnsaid
+	localConns.liftedUnsaid = false
+	localConns.mu.Unlock()
+	if say {
+		c.logf("localnet hold lifted")
+	}
+}
+
+// localDeregister removes c from the live Conns; Close calls it.
+func localDeregister(c *Conn) {
+	localConns.mu.Lock()
+	delete(localConns.set, c)
+	localConns.mu.Unlock()
+}
+
+// LooksLocal reports whether the peer whose node key is k looks local to a
+// live Conn of this process: it shares this device's public IPv4 address or
+// IPv6 network, or, with no public address known, one of its addresses is on
+// a network this device is on. ok is false when no live Conn knows k. It
+// answers whether or not a rule is set; the path in use is the caller's own
+// read.
+func LooksLocal(k key.NodePublic) (looksLocal, ok bool) {
+	for _, c := range localConns.live() {
+		if l, ok := c.localLooksLocal(k); ok {
+			return l, true
+		}
+	}
+	return false, false
+}
+
+// localLooksLocal is LooksLocal for c.
+func (c *Conn) localLooksLocal(k key.NodePublic) (looksLocal, ok bool) {
+	c.mu.Lock()
+	de, ok := c.peerMap.endpointForNodeKey(k)
+	c.mu.Unlock()
+	if !ok {
+		return false, false
+	}
+	f := c.localFacts(mono.Now())
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	return looksLocalFor(&f, maps.Keys(de.endpointState)), true
+}
 
 // looksLocalFor reports whether a peer with the given addresses looks local.
-//
-// STUB: no peer does.
-func looksLocalFor(f *localFacts, peer iter.Seq[netip.AddrPort]) bool { return false }
+func looksLocalFor(f *localFacts, peer iter.Seq[netip.AddrPort]) bool {
+	if f.shares(peer) {
+		return true
+	}
+	if f.known() {
+		return false
+	}
+	for ap := range peer {
+		if f.onOwnNetwork(ap.Addr()) {
+			return true
+		}
+	}
+	return false
+}
 
-// LooksLocal reports whether the peer whose node key is k looks local.
-//
-// STUB: it knows no peer.
-func LooksLocal(k key.NodePublic) (looksLocal, ok bool) { return false, false }
+// localHeld reports whether Android's hold keeps back a send to ap at now,
+// and writes the held line for it. peer is the peer's node key, or zero.
+func (c *Conn) localHeld(ap netip.AddrPort, peer key.NodePublic, now mono.Time) bool {
+	if !localHoldOn() || ap.Addr() == tailcfg.DerpMagicIPAddr {
+		return false
+	}
+	f := c.localFacts(now)
+	if !f.inScope(ap.Addr()) {
+		return false
+	}
+	c.localLine("held", peer, ap, now)
+	return true
+}
 
-// localRegister and localDeregister keep the set of live Conns.
-//
-// STUB: they keep none.
-func localRegister(c *Conn)   {}
-func localDeregister(c *Conn) {}
+// localOwnNetworkAttempt writes the own-network line when a rule is set and
+// ap, which de is about to try, is on a network this device is on.
+func (c *Conn) localOwnNetworkAttempt(peer key.NodePublic, ap netip.AddrPort, now mono.Time) {
+	if localRule() == nil || ap.Addr() == tailcfg.DerpMagicIPAddr {
+		return
+	}
+	if f := c.localFacts(now); f.onOwnNetwork(ap.Addr()) {
+		c.localLine("own-network", peer, ap, now)
+	}
+}
+
+// localLineWindow is how often one line of a kind is written for one peer
+// and address.
+const localLineWindow = time.Minute
+
+// localLinesMax bounds the per-Conn record of lines written.
+const localLinesMax = 4096
+
+type localLineKey struct {
+	kind string
+	peer key.NodePublic
+	ap   netip.AddrPort
+}
+
+// localLine writes "localnet <kind> <address> peer <short key>" through c's
+// logf, once per kind, peer and address in localLineWindow. The address is
+// written in its own text form, so a log funnel that masks addresses finds
+// it; no line names the platform.
+func (c *Conn) localLine(kind string, peer key.NodePublic, ap netip.AddrPort, now mono.Time) {
+	k := localLineKey{kind, peer, ap}
+	c.local.mu.Lock()
+	if last, ok := c.local.lines[k]; ok && now.Sub(last) < localLineWindow {
+		c.local.mu.Unlock()
+		return
+	}
+	if len(c.local.lines) >= localLinesMax {
+		for k2, t := range c.local.lines {
+			if now.Sub(t) >= localLineWindow {
+				delete(c.local.lines, k2)
+			}
+		}
+		if len(c.local.lines) >= localLinesMax {
+			clear(c.local.lines)
+		}
+	}
+	mak.Set(&c.local.lines, k, now)
+	c.local.mu.Unlock()
+	if peer.IsZero() {
+		c.logf("localnet %s %v", kind, ap)
+		return
+	}
+	c.logf("localnet %s %v peer %s", kind, ap, peer.ShortString())
+}
 
 // localRuleP is the rule every Conn in the process reads; nil is no rule.
 var localRuleP atomic.Pointer[LocalNetworkRule]
@@ -122,9 +274,14 @@ func SetLocalNetworkRule(r LocalNetworkRule) {
 // localRule is the rule, or nil.
 func localRule() *LocalNetworkRule { return localRuleP.Load() }
 
-// resetLocalNetworkForTest returns the process-wide rule to its zero state.
+// resetLocalNetworkForTest returns the process-wide rule to its zero state:
+// no rule, and a hold never released.
 func resetLocalNetworkForTest() {
 	localRuleP.Store(nil)
+	localLifted.Store(false)
+	localConns.mu.Lock()
+	localConns.liftedUnsaid = false
+	localConns.mu.Unlock()
 }
 
 // localWaitMax is how long, right after a Conn starts, an address in the
@@ -139,13 +296,14 @@ type localConnState struct {
 	// endpoint.mu and Conn.mu, and netmon takes its own lock to answer.
 	ifState atomic.Pointer[netmon.State]
 
-	mu    sync.Mutex // guards the cache below
-	valid bool
+	mu    sync.Mutex // guards the fields below
+	valid bool       // the cache below was read from rule and st
 	rule  *LocalNetworkRule
 	st    *netmon.State
 	scope []netip.Prefix
 	own   []netip.Prefix
 	ownV6 []netip.Addr
+	lines map[localLineKey]mono.Time // when each line was last written
 }
 
 // localRefresh reads netmon's interface state into c. c.mu and every
@@ -389,7 +547,13 @@ func (de *endpoint) localAllowLocked(ap netip.AddrPort, now mono.Time) bool {
 		return true
 	}
 	f := de.c.localFacts(now)
-	return decideLocal(&f, ap, maps.Keys(de.endpointState)) == localSend
+	switch decideLocal(&f, ap, maps.Keys(de.endpointState)) {
+	case localSend:
+		return true
+	case localSkip:
+		de.c.localLine("skip", de.publicKey, ap, now)
+	}
+	return false
 }
 
 // localAllow is localAllowLocked at the present moment, taking de.mu.
