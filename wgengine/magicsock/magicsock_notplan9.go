@@ -20,8 +20,6 @@ func shouldRebind(err error) (ok bool, reason string) {
 }
 
 // shouldRebindOn is shouldRebind on the operating system goos.
-//
-// STUB: it reads no goos.
 func shouldRebindOn(goos string, err error) (ok bool, reason string) {
 	switch {
 	// EPIPE/ENOTCONN are common errors when a send fails due to a closed
@@ -35,6 +33,12 @@ func shouldRebindOn(goos string, err error) (ok bool, reason string) {
 	// at times, and return EPERM, but reconnects will establish appropriate
 	// rights associated with a new socket.
 	case errors.Is(err, syscall.EPERM):
+		// Android 17 refuses sends to the local network without
+		// ACCESS_LOCAL_NETWORK, and a new socket is refused the same way,
+		// so on android an EPERM is not treated as healed by a rebind.
+		if goos == "android" {
+			return false, ""
+		}
 		return true, "operation-not-permitted"
 	}
 	return false, ""
