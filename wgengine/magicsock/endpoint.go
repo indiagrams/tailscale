@@ -1157,6 +1157,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		// re-evaluate the best endpoint.
 		if err != nil && isBadEndpointErr(err) {
 			de.noteBadEndpoint(udpAddr)
+			if !udpAddr.vni.IsSet() {
+				de.c.localNoteSendErr(de.publicKey, udpAddr.ap, err, now)
+			}
 		}
 
 		var txBytes int
@@ -1317,11 +1320,14 @@ func (de *endpoint) sendDiscoPing(ep epAddr, discoKey key.DiscoPublic, txid stun
 	size = min(size, MaxDiscoPingSize)
 	padding := max(size-discoPingSize, 0)
 
-	sent, _ := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
+	sent, err := de.c.sendDiscoMessage(ep, de.publicKey, discoKey, &disco.Ping{
 		TxID:    [12]byte(txid),
 		NodeKey: de.c.publicKeyAtomic.Load(),
 		Padding: padding,
 	}, logLevel)
+	if err != nil && !ep.vni.IsSet() {
+		de.c.localNoteSendErr(de.publicKey, ep.ap, err, mono.Now())
+	}
 	if !sent {
 		de.forgetDiscoPing(txid)
 		return

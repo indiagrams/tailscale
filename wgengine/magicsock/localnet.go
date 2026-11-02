@@ -26,6 +26,13 @@ package magicsock
 // most localWaitMax for the first report; with no public address learned,
 // every address is tried, as upstream does. The peer's address list is never
 // changed and nothing is stored: a skipped address is simply not sent to.
+//
+// Whether a peer looks local (LooksLocal) is read beside the rule, rule or no
+// rule. A direct send to a peer's address on a network this device is on
+// that fails host unreachable, the way the system fails one while Local
+// Network is off, keeps that peer looking local for localDeniedWindow: the
+// peer is on this device's network and cannot be reached there, so the
+// embedding app can say why its transfer is slower.
 
 import (
 	"iter"
@@ -74,6 +81,12 @@ type LocalNetworkRule struct {
 	// ping or data, is held (not sent) until [ReleaseLocalNetworkHold]. Once
 	// released, the hold is never set again in this process.
 	Hold bool
+	// TestDenied, LocalNetworkTest only, stands in for the system's Local
+	// Network denial in tests and an embedding app's own test lab: a UDP
+	// send to an address in it fails before any socket, as a denied send
+	// fails (host unreachable), and it counts as a network this device is
+	// on.
+	TestDenied []netip.Prefix
 }
 
 // localLifted is whether the hold was released; it is never cleared.
@@ -145,30 +158,86 @@ func localDeregister(c *Conn) {
 // LooksLocal reports whether the peer whose node key is k looks local to a
 // live Conn of this process: it shares this device's public IPv4 address or
 // IPv6 network, or, with no public address known, one of its addresses is on
-// a network this device is on. ok is false when no live Conn knows k. It
-// answers whether or not a rule is set; the path in use is the caller's own
-// read.
+// a network this device is on, or a send to one of its addresses on a
+// network this device is on failed host unreachable, as the system's Local
+// Network denial fails one, within localDeniedWindow. ok is false when no
+// live Conn knows k. It answers whether or not a rule is set; the path in use
+// is the caller's own read.
 func LooksLocal(k key.NodePublic) (looksLocal, ok bool) {
 	for _, c := range localConns.live() {
-		if l, ok := c.localLooksLocal(k); ok {
+		if l, ok := c.localLooksLocal(k, mono.Now()); ok {
 			return l, true
 		}
 	}
 	return false, false
 }
 
-// localLooksLocal is LooksLocal for c.
-func (c *Conn) localLooksLocal(k key.NodePublic) (looksLocal, ok bool) {
+// localLooksLocal is LooksLocal for c at now.
+func (c *Conn) localLooksLocal(k key.NodePublic, now mono.Time) (looksLocal, ok bool) {
 	c.mu.Lock()
 	de, ok := c.peerMap.endpointForNodeKey(k)
 	c.mu.Unlock()
 	if !ok {
 		return false, false
 	}
-	f := c.localFacts(mono.Now())
+	f := c.localFacts(now)
 	de.mu.Lock()
 	defer de.mu.Unlock()
-	return looksLocalFor(&f, maps.Keys(de.endpointState)), true
+	peer := maps.Keys(de.endpointState)
+	return looksLocalFor(&f, peer) || c.localDenied(&f, k, peer, now), true
+}
+
+// localDeniedWindow is how long a send that failed by the denial keeps its
+// peer looking local, from the latest such failure.
+const localDeniedWindow = 5 * time.Minute
+
+// localDeniedKey is one address of one peer whose send failed by the denial.
+type localDeniedKey struct {
+	peer key.NodePublic
+	ap   netip.AddrPort
+}
+
+// localNoteSendErr is told that a direct send to ap, an address of peer,
+// failed with err. A failure isBadEndpointErr reads as host unreachable, the
+// way the system's Local Network denial fails a send, to an address on a
+// network this device is on, is recorded with its time, rule or no rule, and
+// writes the denied line. Any other failure, and a send to an address on no
+// network this device is on, is not recorded. It takes only c.local.mu.
+func (c *Conn) localNoteSendErr(peer key.NodePublic, ap netip.AddrPort, err error, now mono.Time) {
+	if err == nil || !isBadEndpointErr(err) || peer.IsZero() || ap.Addr() == tailcfg.DerpMagicIPAddr {
+		return
+	}
+	if f := c.localFacts(now); !f.onOwnNetwork(ap.Addr()) {
+		return
+	}
+	c.local.mu.Lock()
+	if len(c.local.denied) >= localLinesMax {
+		for k, t := range c.local.denied {
+			if now.Sub(t) >= localDeniedWindow {
+				delete(c.local.denied, k)
+			}
+		}
+		if len(c.local.denied) >= localLinesMax {
+			clear(c.local.denied)
+		}
+	}
+	mak.Set(&c.local.denied, localDeniedKey{peer, ap}, now)
+	c.local.mu.Unlock()
+	c.localLine("denied", peer, ap, now)
+}
+
+// localDenied reports whether a send to one of peer's addresses, one still on
+// a network this device is on, failed by the denial within localDeniedWindow
+// before now.
+func (c *Conn) localDenied(f *localFacts, k key.NodePublic, peer iter.Seq[netip.AddrPort], now mono.Time) bool {
+	c.local.mu.Lock()
+	defer c.local.mu.Unlock()
+	for ap := range peer {
+		if t, ok := c.local.denied[localDeniedKey{k, ap}]; ok && now.Sub(t) < localDeniedWindow && f.onOwnNetwork(ap.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLocalFor reports whether a peer with the given addresses looks local.
@@ -268,11 +337,23 @@ func SetLocalNetworkRule(r LocalNetworkRule) {
 		return
 	}
 	r.TestPrefixes = slices.Clone(r.TestPrefixes)
+	r.TestDenied = slices.Clone(r.TestDenied)
 	localRuleP.Store(&r)
 }
 
 // localRule is the rule, or nil.
 func localRule() *LocalNetworkRule { return localRuleP.Load() }
+
+// localTestDenial is LocalNetworkTest's stand-in for the system's denial:
+// the error a UDP send to ap fails with, or nil. A send by a peer relay
+// (relayed) is never refused.
+func localTestDenial(ap netip.AddrPort, relayed bool) error {
+	r := localRule()
+	if relayed || r == nil || r.Scope != LocalNetworkTest || !prefixesContain(r.TestDenied, localAddr(ap.Addr())) {
+		return nil
+	}
+	return errHOSTUNREACH
+}
 
 // resetLocalNetworkForTest returns the process-wide rule to its zero state:
 // no rule, and a hold never released.
@@ -304,6 +385,9 @@ type localConnState struct {
 	own   []netip.Prefix
 	ownV6 []netip.Addr
 	lines map[localLineKey]mono.Time // when each line was last written
+	// denied is when a send to each peer's address last failed by the
+	// denial (localNoteSendErr).
+	denied map[localDeniedKey]mono.Time
 }
 
 // localRefresh reads netmon's interface state into c. c.mu and every
@@ -527,6 +611,9 @@ func (c *Conn) localFacts(now mono.Time) localFacts {
 	if !c.local.valid || c.local.rule != rule || c.local.st != st {
 		c.local.scope, _ = localScopeOf(rule, st)
 		c.local.own = ownNetworks(st)
+		if rule != nil && rule.Scope == LocalNetworkTest {
+			c.local.own = append(c.local.own, rule.TestDenied...)
+		}
 		c.local.ownV6 = ownGlobalV6(st)
 		c.local.rule, c.local.st, c.local.valid = rule, st, true
 	}

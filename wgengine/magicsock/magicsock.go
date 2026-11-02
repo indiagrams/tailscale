@@ -1544,6 +1544,9 @@ var errNoUDP = errors.New("no UDP available on platform")
 var errUnsupportedConnType = errors.New("unsupported connection type")
 
 func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
+	if err := localTestDenial(addr.ap, addr.vni.IsSet()); err != nil {
+		return false, err // LocalNetworkTest's stand-in for the system's denial
+	}
 	isIPv6 := false
 	switch {
 	case addr.ap.Addr().Is4():
@@ -1573,6 +1576,9 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
 func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if runtime.GOOS == "js" {
 		return false, errNoUDP
+	}
+	if err := localTestDenial(ipp, isGeneveEncap); err != nil {
+		return false, err // LocalNetworkTest's stand-in for the system's denial
 	}
 	sent, err = c.sendUDPStd(ipp, b)
 	if err != nil {
