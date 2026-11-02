@@ -1581,6 +1581,9 @@ func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (
 	if !hasUDPTransport {
 		return false, errNoUDP
 	}
+	if err := localTestDenial(addr.ap, addr.vni.IsSet()); err != nil {
+		return false, err // LocalNetworkTest's stand-in for the system's denial
+	}
 	isIPv6 := false
 	switch {
 	case addr.ap.Addr().Is4():
@@ -1610,6 +1613,9 @@ func (c *Conn) sendUDPBatch(flow int, addr epAddr, buffs [][]byte, offset int) (
 func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap bool) (sent bool, err error) {
 	if !hasUDPTransport {
 		return false, errNoUDP
+	}
+	if err := localTestDenial(ipp, isGeneveEncap); err != nil {
+		return false, err // LocalNetworkTest's stand-in for the system's denial
 	}
 	sent, err = c.sendUDPStd(ipp, b)
 	if err != nil {
