@@ -326,7 +326,7 @@ func (c *Conn) goDerpConnect(regionID tailcfg.DERPRegionID) {
 // line into a socket TCP buffer. The challenge at present is that connect and
 // reconnect are in the write path and we don't want to block other write
 // operations on those.
-const derpWriteQueueDepth = 32
+const derpWriteQueueDepth = 256
 
 // derpWriteChanForRegion returns a channel to which to send DERP packet write
 // requests. It creates a new DERP connection to regionID if necessary.
