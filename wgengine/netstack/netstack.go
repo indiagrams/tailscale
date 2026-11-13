@@ -404,7 +404,7 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	// arithmetic (https://github.com/google/gvisor/issues/11632), which is
 	// why reno was pinned here; the CUBIC implementation has since been
 	// reworked to use float arithmetic with RFC 9438 target clamping.
-	cubicOpt := tcpip.CongestionControlOption("cubic")
+	cubicOpt := tcpip.CongestionControlOption("reno")
 	tcpipErr := ns.ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &cubicOpt)
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("could not set cubic congestion control: %v", tcpipErr)
